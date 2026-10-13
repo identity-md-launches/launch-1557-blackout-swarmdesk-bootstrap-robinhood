@@ -62,6 +62,7 @@ contract SwarmDeskBootstrapTest is Test {
         address deployed = LocalApplicationFactory(FACTORY).deploy(1, 0, code);
         VmSafe.AccountAccess[] memory accesses = vm.stopAndReturnStateDiff();
         assertEq(deployed, predicted);
+        emit log_named_address("Offline SwarmDesk bootstrap (not a live deployment)", deployed);
         uint256 creations;
         for (uint256 i; i < accesses.length; ++i) {
             VmSafe.AccountAccess memory a = accesses[i];
@@ -145,5 +146,141 @@ contract SwarmDeskBootstrapTest is Test {
         assertEq(version, "2");
         assertEq(chainId, 4663);
         assertEq(verifyingContract, address(desk));
+    }
+
+    function replaceWord(bytes memory args, uint256 index, uint256 value) internal pure {
+        assembly ("memory-safe") { mstore(add(add(args, 32), mul(index, 32)), value) }
+    }
+
+    /// @dev All twelve words are mandatory, including every commitment and packed policy.
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzzConstructorRejectsEachZeroWord(uint8 rawWord) public {
+        bytes memory args = constructorArgs();
+        replaceWord(args, bound(rawWord, 0, 11), 0);
+        bytes memory code = vm.getCode("SwarmDesk.sol:SwarmDesk");
+        vm.expectRevert(InvalidValue.selector); // Local factory reports a failed CREATE2.
+        LocalApplicationFactory(FACTORY).deploy(1, 0, bytes.concat(code, args));
+        assertFalse(LocalApplicationFactory(FACTORY).used(1, 0), "failed deployment occupied the coordinate");
+    }
+
+    function testConstructorRejectsDuplicateTransportsAndQuestions() public {
+        bytes memory args = constructorArgs();
+        replaceWord(args, 1, uint160(address(bytes20(hex"a43e6f75ee006411f79ac1c84120606c2330de82"))));
+        bytes memory code = vm.getCode("SwarmDesk.sol:SwarmDesk");
+        vm.expectRevert(InvalidValue.selector);
+        LocalApplicationFactory(FACTORY).deploy(1, 0, bytes.concat(code, args));
+        args = constructorArgs();
+        replaceWord(args, 7, uint256(0x2fc5a57f2c5f7bc083ea8ac5016234f1a0b1c68a514e5d921956cc57948534ef));
+        vm.expectRevert(InvalidValue.selector);
+        LocalApplicationFactory(FACTORY).deploy(1, 0, bytes.concat(code, args));
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzzConstructorRejectsReservedBitsAndPolicyBoundaries(uint8 rawCase, uint16 raw) public {
+        uint256 policy = 5391989333430298100116863486635657822062725418115979424500284366258177;
+        uint256 which = bound(rawCase, 0, 5);
+        if (which == 0) policy |= bound(raw, 1, type(uint16).max) << 240;
+        if (which == 1) policy = (policy & ~(uint256(type(uint16).max) << 224)) | (bound(raw, 0, 199) << 224);
+        if (which == 2) policy = (policy & ~(uint256(type(uint16).max) << 224)) | (bound(raw, 5001, 65535) << 224);
+        if (which == 3) policy &= ~(uint256(type(uint96).max) << 128);
+        if (which == 4) policy &= ~uint256(type(uint32).max);
+        if (which == 5) {
+            policy &= ~(uint256(type(uint48).max) << 80);
+            policy |= uint256(26122899) << 80; // toBlock immediately before the pinned fromBlock.
+        }
+        bytes memory args = constructorArgs();
+        replaceWord(args, 5, policy);
+        bytes memory code = vm.getCode("SwarmDesk.sol:SwarmDesk");
+        vm.expectRevert(InvalidValue.selector);
+        LocalApplicationFactory(FACTORY).deploy(1, 0, bytes.concat(code, args));
+        assertFalse(LocalApplicationFactory(FACTORY).used(1, 0));
+    }
+
+    /// @dev Exercise packed field isolation at the full supported integer widths. These are
+    /// alternate local constructor inputs, never replacements for the launch's approved words.
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzzPackedFieldsRoundTripWithoutCrossFieldContamination(
+        uint32 chain,
+        uint48 from,
+        uint48 rawTo,
+        uint96 price,
+        uint16 heartbeat
+    ) public {
+        chain = uint32(bound(chain, 1, type(uint32).max));
+        uint48 to = uint48(bound(rawTo, from, type(uint48).max));
+        price = uint96(bound(price, 1, type(uint96).max));
+        heartbeat = uint16(bound(heartbeat, 200, 5000));
+        uint256 policy = uint256(chain) | (uint256(from) << 32) | (uint256(to) << 80) | (uint256(price) << 128)
+            | (uint256(heartbeat) << 224);
+        bytes memory args = constructorArgs();
+        replaceWord(args, 5, policy);
+        SwarmDesk desk = SwarmDesk(
+            LocalApplicationFactory(FACTORY).deploy(1, 0, bytes.concat(vm.getCode("SwarmDesk.sol:SwarmDesk"), args))
+        );
+        SwarmDesk.OracleConfig memory o = desk.oracleConfig();
+        assertEq(o.questionChain, chain);
+        assertEq(o.fromBlock, from);
+        assertEq(o.toBlock, to);
+        assertEq(o.maxPrice, price);
+        assertEq(desk.bindingConfig().heartbeatBps, heartbeat);
+        assertEq(desk.bindingConfig().heartbeatCap, 1 ether);
+        assertEq(desk.bindingConfig().gameConfigHash, GAME_CONFIG_HASH);
+        assertEq(address(desk.registry()), address(0));
+    }
+
+    function testConstructorCannotReceiveNativeValue() public {
+        bytes memory code = initCode();
+        vm.deal(address(this), 1);
+        address result;
+        assembly ("memory-safe") { result := create(1, add(code, 32), mload(code)) }
+        assertEq(result, address(0));
+        assertEq(address(this).balance, 1);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzzUnboundDeskRejectsInvalidBindingCoordinates(uint8 rawCase, uint8 rawIndex) public {
+        SwarmDesk desk = deployDesk();
+        uint256 which = bound(rawCase, 0, 3);
+        uint64 registryLaunch = which == 0 ? 0 : 1;
+        uint64 paramsLaunch = which == 1 ? 0 : 1;
+        uint8 registryIndex = which == 2 ? uint8(bound(rawIndex, 8, 255)) : 0;
+        uint8 paramsIndex = which == 3 ? uint8(bound(rawIndex, 8, 255)) : 0;
+        vm.expectRevert(InvalidValue.selector);
+        desk.bind(FACTORY, "", "", registryLaunch, registryIndex, paramsLaunch, paramsIndex);
+        assertEq(address(desk.registry()), address(0));
+        assertEq(desk.bindingConfig().registryLaunch, 0);
+        assertEq(desk.bindingConfig().paramsLaunch, 0);
+    }
+
+    function testUnboundDeskRejectsEveryActionAndUnknownPrivilegeSelector() public {
+        SwarmDesk desk = deployDesk();
+        OracleAttestation.Attestation memory a;
+        SwarmDesk.OracleConfig memory o = desk.oracleConfig();
+        vm.expectRevert(Unauthorized.selector);
+        desk.onOracleResult(bytes32(uint256(1)), a, "");
+        vm.expectRevert(NotConfigured.selector);
+        vm.prank(o.intake);
+        desk.onOracleResult(bytes32(uint256(1)), a, "");
+        vm.expectRevert(NotConfigured.selector);
+        vm.prank(o.delivery);
+        desk.onOracleResult(bytes32(uint256(1)), a, "");
+        vm.expectRevert(NotConfigured.selector);
+        desk.askBackup(1, "");
+        vm.expectRevert(InvalidValue.selector);
+        desk.askBackup(2, "");
+        vm.expectRevert(InvalidValue.selector);
+        desk.execute(2, "");
+        vm.expectRevert(TooEarly.selector);
+        desk.clearExpired(bytes32(uint256(1)));
+        vm.expectRevert(Unauthorized.selector);
+        desk.onOracleFailure(bytes32(uint256(1)), 1, 0, 0, 0, "");
+        (bool ok,) = address(desk).call(abi.encodeWithSignature("withdraw(address,uint256)", address(this), 1));
+        assertFalse(ok);
+        (ok,) = address(desk).call(abi.encodeWithSignature("setOracleSigner(address)", address(this)));
+        assertFalse(ok);
+        (ok,) = address(desk).call(abi.encodeWithSignature("upgradeTo(address)", address(this)));
+        assertFalse(ok);
+        assertEq(address(desk.registry()), address(0));
+        assertEq(desk.bindingConfig().gameConfigHash, GAME_CONFIG_HASH);
     }
 }
