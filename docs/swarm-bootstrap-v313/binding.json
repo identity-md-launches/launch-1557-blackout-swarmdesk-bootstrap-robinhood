@@ -1,0 +1,10 @@
+{
+  "factory": "0x9c9d2fcb75c2c132c0ac0c42df3819a42347265e",
+  "registryLaunch": "0",
+  "registryIndex": 0,
+  "paramsLaunch": "0",
+  "paramsIndex": 0,
+  "heartbeatBps": 200,
+  "heartbeatCap": "1000000000000000000",
+  "gameConfigHash": "0x11ed7438974e96ecc962201e9c46422c7bf239d725876863fa25a56c734b20d3"
+}
